@@ -318,6 +318,65 @@ Email entrante (webhook Gmail)
 
 **Estado:** ⬜ Pendiente
 
+### 3.7 Múltiples cuentas de correo por usuario
+
+**Objetivo:** Un mismo usuario puede conectar varias cuentas de email — cualquier combinación de Gmail y Outlook — y todas se escanean de forma independiente.
+
+**Modelo de datos** (ya soportado por `private.oauth_tokens`):
+```
+usuario ─── N cuentas OAuth
+             ├── gmail  ·  grmoralesp@gmail.com
+             ├── gmail  ·  grmoralesp@empresa.com      ← cuenta adicional
+             └── outlook ·  grmoralesp@hotmail.com
+```
+- `private.oauth_tokens` ya permite múltiples filas por `user_id` (sin constraint único)
+- `email_address` es la clave de presentación en la UI
+- `provider` distingue `'gmail'` vs `'outlook'`
+
+**Cambios necesarios:**
+
+| Área | Descripción |
+|---|---|
+| `store-oauth-token` | Ya soporta múltiples tokens — cada `(user_id, provider, email_address)` genera una fila nueva |
+| `backfill-gmail` | Recibe `email_address` como parámetro opcional para escanear solo esa cuenta |
+| `backfill-outlook` | Nueva Edge Function similar a `backfill-gmail` pero para Microsoft Graph API |
+| `process-invoice` | Recibir `historyId` + `emailAddress` del Pub/Sub message para identificar qué cuenta originó el evento |
+| Gmail Watch | Crear un Watch independiente por cada cuenta Gmail conectada |
+| `ConnectEmailScreen` | Mostrar lista de cuentas conectadas + botón "+ Agregar cuenta" para Gmail y Outlook |
+| `SettingsScreen` | Permitir desconectar cuentas individualmente (revocar token + eliminar fila + cancelar Watch) |
+
+**Flujo "Agregar cuenta":**
+```
+ConnectEmailScreen
+  └── "+  Agregar Gmail"  |  "+ Agregar Outlook"
+        │
+        ▼
+  OAuth PKCE (expo-auth-session)
+  └── code → store-oauth-token (provider + userId + emailAddress)
+        └── Vault.create_secret  →  nueva fila en oauth_tokens
+        └── Registrar Gmail Watch para esta cuenta
+        └── Lanzar backfill-gmail para esta cuenta (90 días)
+        └── UI actualiza lista de cuentas conectadas
+```
+
+**Flujo "Desconectar cuenta":**
+```
+SettingsScreen > cuenta conectada > "Desconectar"
+  └── Revocar token en Google/Microsoft
+  └── Eliminar Watch (Gmail) o suscripción (Outlook)
+  └── Marcar `is_active = false` en oauth_tokens
+  └── Vault.delete_secret
+  └── UI actualiza lista (cuenta desaparece)
+```
+
+**Consideraciones técnicas:**
+- OAuth de Google permite conectar varias cuentas con el mismo `client_id` — cada autorización retorna un `refresh_token` distinto
+- La pantalla de consentimiento de Google muestra cuál cuenta se está autorizando — no hay ambigüedad
+- Las facturas se guardan con `source_email` para trazar de qué cuenta vinieron
+- Si la misma factura llega por dos cuentas distintas: `onConflict: 'id'` (CUFE como UUID) evita duplicados automáticamente
+
+**Estado:** ⬜ Pendiente
+
 ---
 
 ## FASE 4 — Sincronización y Seguridad
@@ -505,7 +564,7 @@ export const supabase = createClient(
 |---|---|
 | `LoginScreen` | Login con Google/Microsoft vía Supabase Auth |
 | `ConsentScreen` | Autorización explícita Ley 1581 — bloquea el flujo si no acepta |
-| `ConnectEmailScreen` | Botón "Conectar Gmail" / "Conectar Outlook" + estado de conexión |
+| `ConnectEmailScreen` | Lista de cuentas conectadas (Gmail / Outlook) + botón "+ Agregar cuenta" + opción de desconectar |
 | `InvoiceListScreen` | Lista con filtros (fecha, proveedor, estado, monto), búsqueda |
 | `InvoiceDetailScreen` | CUFE, emisor, receptor, ítems, impuestos, acciones (aprobar/rechazar) |
 | `QRScannerScreen` | Cámara full-screen + overlay de guía + resultado |
@@ -713,7 +772,7 @@ Cada parser recibe el body HTML/texto del correo y retorna un `CanonicalTransact
 |---|---|---|
 | Fase 1 | Infraestructura y scaffolding | ✅ Completa |
 | Fase 2 | Pipeline de procesamiento (núcleo) | ✅ Completa |
-| Fase 3 | Correo electrónico (Gmail / Outlook) | 🔄 Parcial (OAuth + backfill ✅ · Pub/Sub ⬜) |
+| Fase 3 | Correo electrónico (Gmail / Outlook) | 🔄 Parcial (OAuth + backfill ✅ · Pub/Sub ⬜ · multi-cuenta ⬜) |
 | Fase 4 | Sincronización y seguridad | ✅ Completa |
 | Fase 5 | Flujos alternativos (QR / manual) | 🔄 Parcial (stub ✅ · pipeline ⬜) |
 | Fase 6 | Dashboard y UX | 🔄 Parcial (pantallas ✅ · gráficos ⬜) |
