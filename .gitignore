@@ -28,6 +28,13 @@ yarn-error.*
 
 # macOS
 .DS_Store
+
+# Variables de entorno — nunca commitear
+.env
+.env.local
+
+# Google Play service account key
+google-play-service-account.json
 *.pem
 
 # local env files

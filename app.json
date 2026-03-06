@@ -1,30 +1,80 @@
 {
   "expo": {
-    "name": "cuentas",
+    "name": "Cuentas",
     "slug": "cuentas",
+    "scheme": "com.cuentas.app",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.cuentas.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Necesitamos acceso a la cámara para escanear códigos QR de facturas electrónicas DIAN.",
+        "NSPhotoLibraryUsageDescription": "Necesitamos acceso a tus fotos para importar facturas."
+      }
     },
     "android": {
+      "package": "com.cuentas.app",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.VIBRATE"
+      ],
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": false,
+          "data": [
+            {
+              "scheme": "com.cuentas.app"
+            }
+          ],
+          "category": ["BROWSABLE", "DEFAULT"]
+        }
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-sqlite",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#1a73e8"
+        }
+      ],
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Necesitamos acceso a la cámara para escanear códigos QR de facturas electrónicas DIAN.",
+          "enableCodeScanner": true
+        }
+      ],
+      "expo-web-browser"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "23a91375-aecc-41c4-995d-e1c7cf6bf478"
+      }
+    },
+    "owner": "fierdimo"
   }
 }
