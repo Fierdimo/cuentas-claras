@@ -147,11 +147,11 @@ src/
 
 ### 1.4 Primer EAS Development Build
 
-- [x] `eas build --profile development --platform android` ← **EN CURSO**
-- [ ] Instalar el `.apk` en el dispositivo físico
-- [ ] Verificar que Fast Refresh funciona con el development client
+- [x] `eas build --profile development --platform android`
+- [x] Instalar el `.apk` en el dispositivo físico
+- [x] Verificar que Fast Refresh funciona con el development client
 
-**Estado:** ✅ Fase 1 completa — build en progreso
+**Estado:** ✅ Fase 1 completa
 
 ---
 
@@ -226,7 +226,7 @@ Uint8Array (adjunto del correo)
 - Test: ZIP con contraseña → `status: 'locked'`
 - Test: XML de país no registrado → `UnsupportedCountryError`
 
-**Estado:** ✅ Parser y pipeline implementados — pendiente tests con ZIPs reales
+**Estado:** ✅ Fase 2 completa — parser, pipeline y tipos implementados. Tests con ZIPs reales validados en backfill (Colombia Telecomunicaciones, Éxito, etc.)
 
 ---
 
@@ -452,7 +452,11 @@ export const supabase = createClient(
 - `DELETE` → soft-delete local
 - Reconexión automática → trigger full re-fetch
 
-**Estado:** ⬜ Pendiente
+**Estado:** ✅ Fase 4 completa  
+- Migraciones 001–009 ejecutadas en producción  
+- `LocalInvoiceDatabase` (expo-sqlite, WAL mode, sync_status)  
+- `SyncEngine` (upload pending + download incremental)  
+- `useRealtimeSync` (Realtime → SQLite → DeviceEventEmitter → UI)
 
 ---
 
@@ -484,7 +488,10 @@ export const supabase = createClient(
 - UI de desbloqueo: pendiente para iteración futura
 - Arquitectura preparada: `react-native-zip-archive` ya en el build nativo
 
-**Estado:** ⬜ Pendiente
+**Estado:** 🔄 Parcial
+- ✅ `QRScannerScreen` stub implementado  
+- ⬜ Importación manual de ZIP (`expo-document-picker`)  
+- ⬜ Pipeline QR DIAN completamente conectado  
 
 ---
 
@@ -521,7 +528,13 @@ export const supabase = createClient(
 - "Nueva factura recibida de [Proveedor] por $[Monto]"
 - Tap en notificación → navegar a `InvoiceDetailScreen`
 
-**Estado:** ⬜ Pendiente
+**Estado:** 🔄 Parcial  
+- ✅ Pantallas base implementadas: Login, Dashboard, ConnectEmail, InvoiceList, InvoiceDetail, QRScanner  
+- ⬜ Gráficos (gifted-charts): gasto mensual, top proveedores  
+- ⬜ Exportación CSV  
+- ⬜ Notificaciones push reales (Firebase)  
+- ⬜ Filtros y búsqueda en InvoiceList  
+- ⬜ SettingsScreen (cuentas conectadas, eliminar cuenta)
 
 ---
 
@@ -690,7 +703,7 @@ src/transactions/
 
 Cada parser recibe el body HTML/texto del correo y retorna un `CanonicalTransaction` o `null` si no reconoce el formato.
 
-**Estado:** ⬜ Pendiente
+**Estado:** ⬜ Pendiente (requiere Fase 3.6 completa primero)
 
 ---
 
@@ -699,11 +712,11 @@ Cada parser recibe el body HTML/texto del correo y retorna un `CanonicalTransact
 | Fase | Descripción | Estado |
 |---|---|---|
 | Fase 1 | Infraestructura y scaffolding | ✅ Completa |
-| Fase 2 | Pipeline de procesamiento (núcleo) | ⬜ Pendiente |
-| Fase 3 | Correo electrónico (Gmail / Outlook) | ⬜ Pendiente |
-| Fase 4 | Sincronización y seguridad | ✅ Migraciones completas |
-| Fase 5 | Flujos alternativos (QR / manual) | ⬜ Pendiente |
-| Fase 6 | Dashboard y UX | ⬜ Pendiente |
+| Fase 2 | Pipeline de procesamiento (núcleo) | ✅ Completa |
+| Fase 3 | Correo electrónico (Gmail / Outlook) | 🔄 Parcial (OAuth + backfill ✅ · Pub/Sub ⬜) |
+| Fase 4 | Sincronización y seguridad | ✅ Completa |
+| Fase 5 | Flujos alternativos (QR / manual) | 🔄 Parcial (stub ✅ · pipeline ⬜) |
+| Fase 6 | Dashboard y UX | 🔄 Parcial (pantallas ✅ · gráficos ⬜) |
 | Fase 7 | Compliance, pruebas y producción | ⬜ Pendiente |
 | Fase 8 | Movimientos bancarios (transferencias) | ⬜ Pendiente |
 
