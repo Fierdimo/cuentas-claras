@@ -164,6 +164,14 @@ Deno.serve(async (req: Request) => {
       if (!watchRes.ok) {
         // No es fatal — el usuario puede reconectar. Loguear y continuar.
         console.warn('Gmail Watch error:', await watchRes.text())
+      } else {
+        // Guardar la fecha de expiración para que renew-gmail-watch sepa cuándo renovar
+        const watchData = await watchRes.json() as { historyId: string; expiration: string }
+        await supabase.rpc('update_gmail_watch_expiry', {
+          p_user_id:   userId,
+          p_email:     profile.emailAddress,
+          p_expiry_ms: parseInt(watchData.expiration, 10),
+        })
       }
     }
 

@@ -1,14 +1,15 @@
 /**
  * Edge Function: backfill-gmail
  *
- * Escanea los últimos 90 días de Gmail del usuario buscando facturas DIAN (ZIPs).
- * Se llama automáticamente desde store-oauth-token al conectar por primera vez.
+ * Escanea Gmail del usuario buscando facturas DIAN (ZIPs).
+ * Soporta múltiples cuentas: si se pasa emailAddress, solo escanea esa cuenta;
+ * si no, usa la primera cuenta activa (retrocompatible).
  *
  * Soporta paginación: el cliente puede llamarla varias veces con pageToken
  * para procesar lotes grandes sin exceder el timeout de Edge Functions.
  *
- * Request: POST { userId, pageToken? }
- * Response: { processed, total, nextPageToken?, done }
+ * Request: POST { userId, emailAddress?, pageToken?, sinceDate? }
+ * Response: { processed, total, nextPageToken?, done, sinceDate, isIncremental, emailAddress }
  */
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
@@ -21,8 +22,10 @@ const DAYS_BACK  = 90
 const BATCH_SIZE = 20   // mensajes por llamada (conservador para no exceder timeout)
 
 interface BackfillRequest {
-  userId:     string
-  pageToken?: string
+  userId:        string
+  emailAddress?: string  // cuenta específica; si no se pasa, usa la primera activa (retrocompatible)
+  pageToken?:    string
+  sinceDate?:    string  // ISO timestamp — pasado en llamadas paginadas para consistencia entre páginas
 }
 
 Deno.serve(async (req: Request) => {
@@ -46,20 +49,26 @@ Deno.serve(async (req: Request) => {
         { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     }
 
-    const { userId, pageToken } = await req.json() as BackfillRequest
+    const { userId, emailAddress, pageToken, sinceDate: sinceDateFromClient } = await req.json() as BackfillRequest
 
     if (user.id !== userId) {
       return new Response(JSON.stringify({ error: 'No autorizado' }),
         { status: 401, headers: { ...corsHeaders, 'Content-Type': 'application/json' } })
     }
 
-    // ── 2. Obtener refresh token del Vault ────────────────────────────────────
-    // vault_decrypted_secret NO existe como RPC — solo como vista vault.decrypted_secrets.
-    // get_gmail_refresh_token() accede a private.oauth_tokens + vault en un solo paso.
-    const { data: refreshToken, error: tokenRpcError } = await supabase.rpc('get_gmail_refresh_token', {
+    // ── 2. Obtener refresh token + fecha de último sync del Vault ─────────────
+    // get_gmail_sync_info() devuelve ambos en un solo viaje a la DB:
+    //   - refresh_token: para obtener el access token de Google
+    //   - last_synced_at: null → primer sync (90 días), valor → sync incremental
+    const { data: syncRows, error: syncInfoError } = await supabase.rpc('get_gmail_sync_info', {
       p_user_id: userId,
+      p_email:   emailAddress ?? null,
     })
-    console.log(`[backfill] get_gmail_refresh_token rpcError=${tokenRpcError?.message ?? 'none'}`)
+    console.log(`[backfill][${emailAddress ?? 'first'}] get_gmail_sync_info rpcError=${syncInfoError?.message ?? 'none'}`)
+
+    const syncInfo    = Array.isArray(syncRows) ? syncRows[0] : null
+    const refreshToken = syncInfo?.refresh_token as string | null
+    const lastSyncedAt = syncInfo?.last_synced_at as string | null
 
     if (!refreshToken) {
       return new Response(JSON.stringify({ error: 'Cuenta Gmail no conectada o token no encontrado' }),
@@ -90,14 +99,37 @@ Deno.serve(async (req: Request) => {
     }
     const access_token = tokenJson.access_token
 
-    // ── 4. Buscar todos los correos con adjunto en los últimos 90 días ──────────
+    // ── 4. Determinar rango de fechas y construir query ─────────────────────
     // NO usamos filename:zip — ese filtro busca archivos llamados literalmente "zip".
     // El ZIP de Éxito se llama "UR6819810.zip" y no matchea.
     // Filtramos por extensión en el paso 5 al inspeccionar las partes del mensaje.
-    const afterDate = new Date(Date.now() - DAYS_BACK * 24 * 60 * 60 * 1000)
-    const afterStr  = `${afterDate.getFullYear()}/${String(afterDate.getMonth() + 1).padStart(2, '0')}/${String(afterDate.getDate()).padStart(2, '0')}`
-    const query = `has:attachment after:${afterStr}`
-    console.log(`[backfill] query: ${query}`)
+    //
+    // Estrategia de rango:
+    //  - sinceDateFromClient: segunda+ página de un scan en curso → usar tal cual (consistencia)
+    //  - lastSyncedAt != null: sync incremental → desde lastSyncedAt con 10 min de buffer
+    //    para capturar emails que llegaron justo antes del cierre del último sync
+    //  - lastSyncedAt == null: primer sync → últimos 90 días
+    let afterDate: Date
+    let isIncremental = false
+
+    if (sinceDateFromClient) {
+      // Continuación de un scan paginado — mantener la misma fecha de inicio
+      afterDate = new Date(sinceDateFromClient)
+      isIncremental = !!lastSyncedAt
+    } else if (lastSyncedAt) {
+      // Sync incremental: desde el último sync con 10 minutos de solapamiento
+      afterDate = new Date(new Date(lastSyncedAt).getTime() - 10 * 60 * 1000)
+      isIncremental = true
+    } else {
+      // Primer sync: últimos 90 días
+      afterDate = new Date(Date.now() - DAYS_BACK * 24 * 60 * 60 * 1000)
+    }
+
+    // Gmail acepta epoch seconds en after: para precisión exacta (no solo YYYY/MM/DD)
+    const afterEpoch = Math.floor(afterDate.getTime() / 1000)
+    const sinceDateISO = afterDate.toISOString()
+    const query = `has:attachment after:${afterEpoch}`
+    console.log(`[backfill] modo=${isIncremental ? 'incremental' : 'inicial'} after=${afterDate.toISOString()} query: ${query}`)
 
     const listUrl = new URL(`${GMAIL_API}/messages`)
     listUrl.searchParams.set('q', query)
@@ -352,7 +384,7 @@ Deno.serve(async (req: Request) => {
 
     // ── 6. Marcar backfill como completado si es la última página ─────────────
     if (!nextPageToken) {
-      await supabase.rpc('mark_backfill_completed', { p_user_id: userId })
+      await supabase.rpc('mark_backfill_completed', { p_user_id: userId, p_email: emailAddress ?? null })
     }
 
     return new Response(
@@ -361,6 +393,9 @@ Deno.serve(async (req: Request) => {
         total,
         nextPageToken: nextPageToken ?? null,
         done: !nextPageToken,
+        sinceDate:    sinceDateISO,  // el cliente lo reenvía en páginas siguientes para consistencia
+        isIncremental,
+        emailAddress: emailAddress ?? null,
       }),
       { status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     )

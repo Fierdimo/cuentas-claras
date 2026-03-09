@@ -2,11 +2,13 @@ import React from 'react'
 import { View, Text, TouchableOpacity, ScrollView, StyleSheet, ActivityIndicator } from 'react-native'
 import { useInvoices } from '../hooks/useInvoices'
 import { useAuth } from '../hooks/useAuth'
+import { usePendingMovements } from '../hooks/usePendingMovements'
 import type { CanonicalInvoice } from '../invoice/types/canonical'
 
 interface Props {
-  onConnectEmail: () => void
-  onOpenInvoiceList: () => void
+  onConnectEmail:      () => void
+  onOpenInvoiceList:   () => void
+  onOpenBankMovements: () => void
 }
 
 /**
@@ -15,9 +17,10 @@ interface Props {
  * - Acceso rápido a conectar correo y lista de facturas.
  * Fase 6: Añadir gráficos (react-native-gifted-charts), alertas de facturas próximas a vencer.
  */
-export default function DashboardScreen({ onConnectEmail, onOpenInvoiceList }: Props): React.JSX.Element {
+export default function DashboardScreen({ onConnectEmail, onOpenInvoiceList, onOpenBankMovements }: Props): React.JSX.Element {
   const { user, signOut } = useAuth()
   const { invoices, isLoading, isSyncing, lastSyncAt } = useInvoices(user?.id ?? null)
+  const { count } = usePendingMovements(user?.id ?? null)
 
   const thisMonth = React.useMemo(() => {
     const now = new Date()
@@ -72,6 +75,17 @@ export default function DashboardScreen({ onConnectEmail, onOpenInvoiceList }: P
           <Text style={styles.actionIcon}>📋</Text>
           <Text style={styles.actionLabel}>Ver facturas</Text>
         </TouchableOpacity>
+        <TouchableOpacity style={styles.actionCard} onPress={onOpenBankMovements}>
+          <View>
+            <Text style={styles.actionIcon}>🏦</Text>
+            {count > 0 && (
+              <View style={styles.badge}>
+                <Text style={styles.badgeText}>{count > 99 ? '99+' : count}</Text>
+              </View>
+            )}
+          </View>
+          <Text style={styles.actionLabel}>Movimientos</Text>
+        </TouchableOpacity>
       </View>
 
       {/* TODO Fase 6: Gráfico de barras por mes (react-native-gifted-charts) */}
@@ -112,4 +126,17 @@ const styles = StyleSheet.create({
   },
   actionIcon: { fontSize: 28, marginBottom: 8 },
   actionLabel: { fontSize: 13, fontWeight: '600', color: '#374151', textAlign: 'center' },
+  badge: {
+    position: 'absolute',
+    top: -4,
+    right: -4,
+    backgroundColor: '#ef4444',
+    borderRadius: 10,
+    minWidth: 20,
+    height: 20,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 4,
+  },
+  badgeText: { color: '#fff', fontSize: 11, fontWeight: '700' },
 })

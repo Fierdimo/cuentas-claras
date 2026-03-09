@@ -15,11 +15,12 @@ interface UseAuthState {
 }
 
 interface UseAuthActions {
-  signInWithEmail: (email: string, password: string) => Promise<void>
-  signUpWithEmail: (email: string, password: string) => Promise<void>
-  signInWithGoogle: () => Promise<void>
-  signOut: () => Promise<void>
-  clearError: () => void
+  signInWithEmail:   (email: string, password: string) => Promise<void>
+  signUpWithEmail:   (email: string, password: string) => Promise<void>
+  signInWithGoogle:  () => Promise<void>
+  signOut:           () => Promise<void>
+  clearError:        () => void
+  saveProfileName:   (name: string) => Promise<void>
 }
 
 type UseAuthReturn = UseAuthState & UseAuthActions
@@ -134,6 +135,29 @@ export function useAuth(): UseAuthReturn {
 
   const clearError = useCallback(() => setError(null), [])
 
+  /**
+   * Guarda el nombre del usuario en user_own_counterparts (source_bank=null).
+   * Se usa tanto para auto-guardar desde el perfil OAuth como para el nombre
+   * ingresado manualmente. UPSERT por (user_id, name_lower) — idempotente.
+   */
+  const saveProfileName = useCallback(async (name: string) => {
+    if (!user) return
+    const trimmed = name.trim()
+    if (!trimmed) return
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase as any)
+      .from('user_own_counterparts')
+      .upsert(
+        {
+          user_id:    user.id,
+          name:       trimmed,
+          name_lower: trimmed.toLowerCase(),
+          source_bank: null,   // null = proviene del perfil, no de un movimiento
+        },
+        { onConflict: 'user_id,name_lower', ignoreDuplicates: true }
+      )
+  }, [user])
+
   return {
     session,
     user,
@@ -144,5 +168,6 @@ export function useAuth(): UseAuthReturn {
     signInWithGoogle,
     signOut,
     clearError,
+    saveProfileName,
   }
 }

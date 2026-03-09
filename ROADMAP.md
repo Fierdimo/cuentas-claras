@@ -23,24 +23,34 @@
 | Entidades de datos | **Facturas** y **Movimientos** son tablas y listas separadas | Diferente modelo, diferente propósito: DIAN vs. banco |
 | Intercepción bancaria | Notificación propia + **confirmación explícita del usuario** | El usuario es el guardián — elimina duplicados automáticos |
 | Fuente principal de movimientos | Email bancario (Nequi, Bancolombia, Davivienda…) | Más confiable que push/SMS, cubre offline y no requiere permiso especial |
+| Rango de escaneo Gmail | **Incremental** — 90 días solo en primer sync, luego desde `backfill_completed_at` − 10 min | Minimiza cuota Gmail API y tiempo de carga en aperturas sucesivas |
+| Correo IMAP | **App password** almacenada en Vault + sync disparado desde el cliente en momentos clave | Sin polling automático; mismo patrón que `backfill-gmail` — consume API solo cuando hay potencial de datos nuevos |
+| Credenciales IMAP | Nunca en el dispositivo — solo en Vault (igual que refresh tokens) | Misma arquitectura de seguridad que OAuth; el cliente solo envía el password una vez |
 
 ---
 
 ## Fases del Proyecto
 
 ```
-FASE 1 ── Infraestructura y núcleo          ← INICIO AQUÍ
-FASE 2 ── Pipeline de procesamiento
+FASE 1 ── Infraestructura y núcleo          ✅ Completa
+FASE 2 ── Pipeline de procesamiento         ✅ Completa
 FASE 3 ── Correo electrónico (Gmail / Outlook)
-          └── 3.6 Parseo de correos bancarios
-FASE 4 ── Sincronización y seguridad
-FASE 5 ── Flujos alternativos (QR / manual)
-FASE 6 ── Dashboard y UX
-FASE 7 ── Compliance, pruebas y producción
-FASE 8 ── Movimientos bancarios (transferencias)
-          ├── Email bancario como fuente primaria
-          ├── Confirmación explícita del usuario
-          └── Lista separada de facturas
+          ├── 3.6 Parseo de correos bancarios      ✅
+          ├── 3.7 Múltiples cuentas de correo      ✅
+          └── 3.8 Correo IMAP (empresarial)        ⬜
+FASE 4 ── Sincronización y seguridad        ✅ Completa
+FASE 5 ── Flujos alternativos (QR / manual) 🔄 Parcial
+FASE 6 ── Dashboard y UX                    🔄 Parcial
+FASE 7 ── Compliance, pruebas y producción  ⬜ Pendiente
+FASE 8 ── Movimientos bancarios             🔄 En progreso  ← AQUÍ
+          ├── 8.1 Tabla pending_movements         ✅
+          ├── 8.2 Detección por email bancario     ✅
+          ├── 8.3 Confirmación/rechazo usuario     ✅
+          ├── 8.4 Transferencias internas          ✅
+          ├── 8.5 Movimientos manuales (FAB)       ✅
+          ├── 8.6 Timeline unificado con facturas  ✅
+          └── 8.7 Otras fuentes no detectadas      ⬜
+                  (PSE, tiendas online, etc.)
 ```
 
 ---
@@ -243,6 +253,8 @@ Uint8Array (adjunto del correo)
 - La Edge Function hace el exchange y guarda el refresh token en **Supabase Vault**
 - El refresh token **nunca llega al dispositivo**
 
+**Estado:** ✅ Completo
+
 ### 3.2 Edge Function `store-oauth-token`
 
 - Recibe: `{ code, provider, userId, redirectUri }`
@@ -250,6 +262,8 @@ Uint8Array (adjunto del correo)
 - Guarda en Vault: `vault.create_secret(refresh_token, name, description)`
 - Guarda metadata en `private.oauth_tokens` (referencia al secret ID, no el token)
 - Responde: `{ success: true, emailAddress }`
+
+**Estado:** ✅ Completo
 
 ### 3.3 Edge Function `process-invoice` (Gmail webhook)
 
@@ -267,6 +281,8 @@ Pipeline interno:
 6. Guardar `CanonicalInvoice` en tabla `invoices`
 7. Enviar push notification vía Expo Push API
 
+**Estado:** ✅ Completo — infraestructura webhook funcional; `process-invoice` desplegado
+
 ### 3.4 Gmail Watch + Google Cloud Pub/Sub
 
 - Crear topic en Google Cloud: `projects/{PROJECT}/topics/gmail-invoices`
@@ -274,12 +290,28 @@ Pipeline interno:
 - Registrar watch: `POST /gmail/v1/users/me/watch` con `{ topicName, labelIds: ['INBOX'] }`
 - Watch expira cada 7 días → renovar automáticamente con `pg_cron`
 
-### 3.5 Escaneo inicial (backfill)
+**Estado:** ⏸ Diferido — se implementa junto con notificaciones push (§6.4); el backfill incremental cubre el caso de uso actual completamente
 
-Al conectar el correo por primera vez:
-- Buscar últimos 90 días: `q: "has:attachment filename:zip"` + keywords DIAN
-- Procesar en lote (máx. 50 por request para no exceder cuota Gmail API)
-- Mostrar progreso al usuario
+### 3.5 Escaneo de correos (backfill incremental)
+
+Estrategia de rango adaptativa según el estado de sincronización:
+
+| Situación | Rango consultado | Razón |
+|---|---|---|
+| Primera vez (`backfill_completed_at = null`) | Últimos **90 días** | Escaneo histórico completo |
+| App abierta con sync previo (> 5 min) | Desde `backfill_completed_at` − 10 min | Solo emails nuevos, mínimo consumo de cuota |
+| App abierta con sync reciente (< 5 min) | No dispara | Cooldown para evitar llamadas redundantes |
+
+**Implementación:**
+- Query usa epoch timestamp (`after:1234567890`) para precisión exacta (no solo fecha)
+- Buffer de 10 min en el límite inferior para capturar emails que llegaron justo antes del cierre del sync previo
+- Duplicados eliminados automáticamente en upsert (`onConflict: 'id'` con CUFE como UUID)
+- Paginación de 20 mensajes por llamada; `sinceDate` se pasa entre páginas para consistencia
+- `backfill_completed_at` en `private.oauth_tokens` actúa como `last_synced_at` y se actualiza al terminar cada scan
+- RPC `get_gmail_sync_info()` devuelve refresh token + `last_synced_at` en un solo viaje a la DB (migración `010`)
+- Auto-trigger en `useConnectedAccounts` al montar el hook (cooldown de 5 min en cliente)
+
+**Estado:** ✅ Completo — migración `010`, `backfill-gmail` actualizado y desplegado
 
 ### 3.6 Parseo de correos bancarios (Movimientos)
 
@@ -316,7 +348,7 @@ Email entrante (webhook Gmail)
 
 **Nota:** Nunca se registra automáticamente. El movimiento queda en estado `pending_confirmation` hasta que el usuario aprueba.
 
-**Estado:** ⬜ Pendiente
+**Estado:** ✅ Completo — `detect-bank-emails` desplegada; allowlist de 10 bancos; parsers conocidos (Nequi, Bancolombia, Davivienda, Daviplata); reglas aprendidas en DB (`bank_email_parsers`); fallback Perplexity que guarda reglas para reusar; `pending_movements` tabla con deduplicación por `gmail_msg_id`
 
 ### 3.7 Múltiples cuentas de correo por usuario
 
@@ -375,9 +407,105 @@ SettingsScreen > cuenta conectada > "Desconectar"
 - Las facturas se guardan con `source_email` para trazar de qué cuenta vinieron
 - Si la misma factura llega por dos cuentas distintas: `onConflict: 'id'` (CUFE como UUID) evita duplicados automáticamente
 
+**Estado:** ✅ Completo — migración `011`, `backfill-gmail` actualizado, `useConnectedAccounts` y `ConnectEmailScreen` refactorizados
+
+---
+
+### 3.8 Correo IMAP (empresarial / privado)
+
+**Objetivo:** Soportar cualquier servidor de correo que hable IMAP (Exchange corporativo, Zoho, Fastmail, Yahoo Mail, correo propio, etc.) sin depender de OAuth de Google o Microsoft.
+
+**Por qué IMAP y no OAuth para estos proveedores:**
+- La mayoría de servidores empresariales no exponen OAuth2 en sus propios dominios
+- IMAP sobre TLS (puerto 993) es el estándar universal soportado por cualquier servidor
+- Los proveedores que sí tienen OAuth (Yahoo, iCloud, Fastmail) también soportan IMAP con **app password**, que es más simple de implementar
+
+**Lo que NO aplica:**
+- ProtonMail: requiere el Bridge local instalado en el PC — fuera de alcance
+- Correos con 2FA obligatorio sin app passwords: el usuario debe generar un app password en su proveedor
+
+**Diferencias clave vs Gmail/Outlook OAuth:**
+
+| Aspecto | Gmail / Outlook | IMAP generico |
+|---|---|---|
+| Auth | OAuth2 PKCE (refresh token) | App password en Vault |
+| Disparo de sync | Gmail Watch (Pub/Sub push) | **Event-driven desde el cliente** (mismo patrón que `backfill-gmail`) |
+| Momentos de sync | Tiempo real (push automático) | Apertura de app · botón manual · al conectar cuenta |
+| Credencial a guardar | Refresh token (en Vault) | App password (en Vault) |
+| UI de conexión | Botón OAuth (browser) | Formulario: servidor, puerto, usuario, app password |
+
+**Modelo de datos** — misma tabla `private.oauth_tokens`, nuevo `provider`:
+```sql
+-- provider = 'imap' (nuevo valor al lado de 'gmail' y 'outlook')
+-- email_address = la dirección del usuario
+-- refresh_token_secret_id apunta al Vault donde está el app password
+-- Nueva columna necesaria (migración 012):
+ALTER TABLE private.oauth_tokens
+  ADD COLUMN IF NOT EXISTS imap_host TEXT,    -- mail.empresa.com
+  ADD COLUMN IF NOT EXISTS imap_port INTEGER DEFAULT 993;
+```
+
+**Flujo de conexión:**
+```
+ConnectEmailScreen → "+  Agregar IMAP"
+  └── FormularioIMAP: host, puerto (993), usuario, app password
+        └── store-imap-credentials (nueva Edge Function)
+              └── Validar conexión (IMAP CAPABILITY + LOGIN de prueba)
+              └── App password → Vault.create_secret
+              └── Guardar metadata en oauth_tokens (provider='imap', host, port)
+              └── Lanzar backfill-imap (90 días inicial)
+              └── Responde: { success, emailAddress }
+```
+
+**Sync event-driven (sin polling automático):**
+
+IMAP no tiene webhooks ni push nativo, pero el cron automático tiene un costo alto: procesamiento garantizado, resultados probables de cero. En cambio, se adopta el mismo patrón que `backfill-gmail`:
+
+| Momento | Acción |
+|---|---|
+| **App se abre** (hook mount) | `runBackfill('imap', email)` si han pasado > 5 min desde último sync |
+| **Botón “Escanear correos”** | `runBackfill('imap', email)` inmediato, sin cooldown |
+| **Al conectar la cuenta** | Escaneo inicial de 90 días |
+| **App en background** | Sin actividad — IMAP no corre en background |
+
+Ventajas vs polling:
+- Cero peticiones en momentos en los que el usuario no usa la app
+- El usuario tiene control total y feedback inmediato
+- Sin costo de Supabase Edge Function en idle
+- `backfill_completed_at` ya existe en `oauth_tokens` — sirve como `last_synced_at` para IMAP sin cambios de esquema adicionales
+
+**Nuevas Edge Functions necesarias:**
+
+| Función | Descripción |
+|---|---|
+| `store-imap-credentials` | Recibe host/port/user/password, valida conexión IMAP, guarda en Vault |
+| `sync-imap` | Escaneo inicial (90 días) o incremental — misma firma que `backfill-gmail` (`userId`, `emailAddress`, `pageToken?`, `sinceDate?`); disparado desde el cliente en momentos clave |
+
+**Implementación IMAP en Deno:**
+- Deno soporta `Deno.connectTls()` nativo para conexiones IMAP sobre TLS
+- Biblioteca: [`imapflow`](https://imapflow.com/) via `npm:imapflow` (Deno NPM compat) o implementación minimal del protocolo
+- Comando IMAP clave: `SEARCH SINCE DD-Mon-YYYY` para escaneo incremental (equivalente al `after:` de Gmail)
+- Archivos a buscar: adjuntos con extensión `.zip` (igual que en Gmail)
+
+**UI — `ConnectEmailScreen`:**
+- Nuevo botón “+ Agregar IMAP / empresarial” que abre un `Modal` con el formulario
+- Campos: servidor IMAP, puerto (default 993), correo, app password
+- Enseñar enlace de ayuda por proveedor popular (Gmail, Yahoo, iCloud, Outlook.com) apuntando a la página oficial de app passwords
+- Las tarjetas de cuentas IMAP muestran el host en lugar del proveedor: `✉️ usuario@empresa.com · mail.empresa.com`
+
 **Estado:** ⬜ Pendiente
 
 ---
+
+**Estado:** 🔄 Parcial  
+- ✅ OAuth PKCE — Gmail y Outlook (`store-oauth-token` + Vault)  
+- ✅ `process-invoice` — infraestructura webhook funcional  
+- ⏸ Gmail Watch / Pub/Sub — diferido a §6.4 (notificaciones push); backfill incremental cubre el caso de uso actual  
+- ✅ Backfill incremental — migración `010`, `backfill-gmail` desplegado  
+- ✅ Multi-cuenta — migración `011`, `ConnectEmailScreen` y `useConnectedAccounts` actualizados  
+- ✅ Parseo de correos bancarios — `detect-bank-emails` + allowlist + Perplexity fallback + reglas aprendidas en DB  
+- ⏸ Soporte Outlook (`backfill-outlook` pendiente) — requiere cuenta Azure AD  
+- ⬜ IMAP (`store-imap-credentials` + `sync-imap` pendientes)  
 
 ## FASE 4 — Sincronización y Seguridad
 
@@ -512,7 +640,7 @@ export const supabase = createClient(
 - Reconexión automática → trigger full re-fetch
 
 **Estado:** ✅ Fase 4 completa  
-- Migraciones 001–009 ejecutadas en producción  
+- Migraciones 001–013 aplicadas en producción  
 - `LocalInvoiceDatabase` (expo-sqlite, WAL mode, sync_status)  
 - `SyncEngine` (upload pending + download incremental)  
 - `useRealtimeSync` (Realtime → SQLite → DeviceEventEmitter → UI)
@@ -530,6 +658,8 @@ export const supabase = createClient(
 - Pasar por el mismo pipeline del paso 2.5
 - Guardar con `source: 'manual'`
 
+**Estado:** ⬜ Pendiente
+
 ### 5.2 Escáner QR DIAN
 
 - `react-native-vision-camera` + `useCodeScanner({ codeTypes: ['qr'] })`
@@ -538,6 +668,8 @@ export const supabase = createClient(
 - Mostrar `WebView` con la URL DIAN (visualización oficial)
 - Guardar registro con `source: 'qr'`, `authorizationCode: cufe`, `status: 'pending'`
 - Permitir al usuario completar campos adicionales manualmente
+
+**Estado:** 🔄 Parcial — `QRScannerScreen` stub implementado; validación CUFE y conexión con pipeline real pendientes
 
 ### 5.3 ZIP con contraseña (stub)
 
@@ -571,16 +703,22 @@ export const supabase = createClient(
 | `DashboardScreen` | Gráficos: gasto por mes, top proveedores, por categoría |
 | `SettingsScreen` | Cuentas de correo conectadas, eliminar cuenta, política de privacidad |
 
+**Estado:** 🔄 Parcial — Login, Dashboard, ConnectEmail, InvoiceList, InvoiceDetail, QRScanner implementadas; ConsentScreen y SettingsScreen pendientes
+
 ### 6.2 Gráficos (`react-native-gifted-charts`)
 
 - Barras: gasto mensual (últimos 12 meses)
 - Torta: distribución por categoría
 - Lista: top 10 proveedores por monto total
 
+**Estado:** ⬜ Pendiente
+
 ### 6.3 Exportación CSV
 
 - Generar CSV en memoria con facturas filtradas
 - Compartir vía `expo-sharing` (Share sheet nativo)
+
+**Estado:** ⬜ Pendiente
 
 ### 6.4 Notificaciones push
 
@@ -744,25 +882,65 @@ if (existingTransaction) {
 | `PendingTransactionsScreen` | Bandeja de movimientos `pending_confirmation` esperando aprobación |
 | `TransactionDetailScreen` | Detalle: monto, contraparte, evidencias, fecha, estado |
 
-### 8.5 Parsers de email bancario (`src/transactions/parsers/`)
+### 8.5 Parsers de email bancario
 
-```
-src/transactions/
-├── types/
-│   └── transaction.ts          ← CanonicalTransaction
-├── parsers/
-│   ├── IBankEmailParser.ts     ← Misma interfaz que IInvoiceParser
-│   ├── NequiEmailParser.ts
-│   ├── BancolombiaEmailParser.ts
-│   ├── DaviviendaEmailParser.ts
-│   └── DaviplataEmailParser.ts
-├── BankEmailParserFactory.ts   ← Registry por dominio del remitente
-└── pendingTransactionService.ts ← Crear / deduplicar / confirmar
-```
+**Estado:** ✅ Implementado — `detect-bank-emails` Edge Function desplegada con:
+- Allowlist de 10 bancos/apps colombianas (Nequi, Bancolombia, Davivienda, Daviplata, BBVA, Colpatria, AV Villas, Scotiabank, Itaú, Falabella)
+- Parsers conocidos para los 4 emisores principales
+- Fallback Perplexity AI para formatos desconocidos + aprendizaje en `bank_email_parsers`
+- Tabla `pending_movements` con deduplicación por `gmail_msg_id`
+- `BankMovementsScreen` con confirmación/rechazo, filtros, búsqueda, selector de mes y resumen de totales
 
-Cada parser recibe el body HTML/texto del correo y retorna un `CanonicalTransaction` o `null` si no reconoce el formato.
+### 8.6 Timeline unificado con facturas
 
-**Estado:** ⬜ Pendiente (requiere Fase 3.6 completa primero)
+**Estado:** ✅ Implementado
+- `useFinancialTimeline` — hook maestro que cruza movimientos e invoices
+- Ventana de detección de duplicados: 15 días (cross-month)
+- Confianza graduada: `probable` (nombre + ≤5 días) / `possible` (nombre 6-15 días ó sin nombre ≤3 días)
+- `possibleMatches`: movimiento → facturas candidatas
+- `invoiceToMovementMatches`: factura → movimientos candidatos (mapa inverso)
+- Facturas huérfanas sugieren movimiento vinculable; movimientos sugieren factura vinculable
+- Migración `019`: `linked_invoice_id` en `pending_movements` + `linked_movement_id` en `invoices`
+
+### 8.7 Movimientos manuales (cash / fuentes no detectables)
+
+**Estado:** ✅ Implementado
+- FAB `+` en `BankMovementsScreen` abre formulario bottom sheet
+- Campos: dirección (crédito/débito), monto, descripción, fuente (chip selector), fecha (±días)
+- Fuentes disponibles: Efectivo · Nequi · Bancolombia · Davivienda · Daviplata · BBVA · Otro
+- `gmail_msg_id = null` como identificador de movimiento manual (sin columna extra)
+- `createManual` / `deleteManual` en `usePendingMovements`
+- Migración `020`: columna `source TEXT DEFAULT 'email'` en `pending_movements`
+- RLS: el usuario debe agregar políticas INSERT + DELETE en Supabase (ver notas abajo)
+
+### 8.8 Fuentes de movimientos aún no detectadas automáticamente ⚠️
+
+Existe un conjunto de transacciones frecuentes que **no llegan por correo bancario** y por tanto no son capturadas automáticamente por el pipeline actual. Deben ingresarse de forma manual hasta que se implemente detección específica para cada fuente:
+
+| Tipo | Ejemplos | Dificultad de detección | Posible fuente futura |
+|---|---|---|---|
+| **Pagos PSE** | Servicios públicos (EPM, Codensa, Gas Natural), impuestos DIAN/municipio, seguros | Media | Email de confirmación del banco + email del proveedor |
+| **Tiendas online** | Mercado Libre, Falabella.com, Shein, Amazon, Rappi, iFood | Media | Email de confirmación de compra (remitente del marketplace) |
+| **Suscripciones digitales** | Netflix, Spotify, Adobe, Google Play, Apple | Baja | Email de recibo/factura del servicio |
+| **Pagos con tarjeta en POS físico** | Supermercados, restaurantes, gasolineras | Alta | No hay email; requeriría integración con extracto bancario o captura manual |
+| **Retiros y depósitos ATM** | Cajeros automáticos | Alta | No hay email; requeriría integración con extracto bancario |
+| **Pagos QR Nequi / Bancolombia A la mano** | Comercios con código QR | Media | Nequi ya envía correo; Bancolombia a veces envía alerta |
+| **Giros nacionales** | Efecty, Baloto, Giro Bancolombia | Baja | Email de confirmación del operador |
+| **Recargas de celular** | Tigo, Claro, Movistar | Baja | Email de confirmación del operador |
+
+**Estrategia recomendada para cobertura incremental:**
+
+1. **Corto plazo:** El usuario puede registrar cualquiera de estos manualmente con el FAB `+` ya implementado, eligiendo la fuente "Otro".
+2. **Mediano plazo:** Agregar parsers para emails de confirmación de tiendas online frecuentes (Mercado Libre, Rappi, Netflix) — siempre envían email con monto y descripción claros.
+3. **Largo plazo:** Integración con extracto bancario en PDF (Bancolombia, Davivienda) para capturar pagos en POS y ATM que nunca generan email; requiere OCR o parser estructurado del PDF.
+
+**Pendiente de implementar:**
+- [ ] Parsers de email para pagos PSE (el banco notifica en el mismo formato que una transacción normal)
+- [ ] Parsers de email para Mercado Libre (`no-reply@mercadolibre.com.co`)
+- [ ] Parsers de email para Rappi (`noreply@rappi.com`)
+- [ ] Parsers de email para suscripciones (Netflix, Spotify → factura mensual)
+- [ ] Importación de extracto bancario PDF → movimientos (OCR / parser estructurado)
+- [ ] En formulario manual: ampliar lista de fuentes con PSE, Mercado Libre, Rappi, etc.
 
 ---
 
@@ -772,12 +950,14 @@ Cada parser recibe el body HTML/texto del correo y retorna un `CanonicalTransact
 |---|---|---|
 | Fase 1 | Infraestructura y scaffolding | ✅ Completa |
 | Fase 2 | Pipeline de procesamiento (núcleo) | ✅ Completa |
-| Fase 3 | Correo electrónico (Gmail / Outlook) | 🔄 Parcial (OAuth + backfill ✅ · Pub/Sub ⬜ · multi-cuenta ⬜) |
+| Fase 3 | Correo electrónico (Gmail / Outlook / IMAP) | 🔄 Parcial (OAuth + backfill ✅ · multi-cuenta ✅ · bancario ✅ · renew-watch ⬜ · Pub/Sub ⬜ · IMAP ⬜) |
 | Fase 4 | Sincronización y seguridad | ✅ Completa |
 | Fase 5 | Flujos alternativos (QR / manual) | 🔄 Parcial (stub ✅ · pipeline ⬜) |
 | Fase 6 | Dashboard y UX | 🔄 Parcial (pantallas ✅ · gráficos ⬜) |
 | Fase 7 | Compliance, pruebas y producción | ⬜ Pendiente |
-| Fase 8 | Movimientos bancarios (transferencias) | ⬜ Pendiente |
+| Fase 8 | Movimientos bancarios | 🔄 En progreso (detección email ✅ · confirmación ✅ · transferencias ✅ · manuales ✅ · timeline unificado ✅ · PSE/online/POS ⬜) |
+
+> **Nota Fase 8:** Existe una brecha conocida de movimientos no detectables automáticamente (PSE, tiendas online, POS físico, ATM). Ver §8.8 para el inventario completo y la estrategia de cobertura incremental.
 
 ---
 
@@ -797,6 +977,11 @@ OUTLOOK_CLIENT_SECRET=                  # Solo en Edge Functions
 GMAIL_WEBHOOK_SECRET=                   # HMAC para validar webhooks
 GMAIL_PUBSUB_SERVICE_ACCOUNT=           # Email de la cuenta de servicio Google
 GMAIL_WEBHOOK_AUDIENCE=                 # URL del Edge Function
+
+# IMAP genérico (correo empresarial / privado)
+# Las credenciales NO van aquí — se guardan en Vault desde store-imap-credentials
+# Solo se necesitan en Edge Functions que accedan al Vault
+# (reutilizan SUPABASE_SERVICE_ROLE_KEY ya definido arriba)
 ```
 
 ---

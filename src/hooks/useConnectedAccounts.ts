@@ -39,6 +39,9 @@ const OAUTH_CALLBACK_URI   = `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/
 // URI que WebBrowser.openAuthSessionAsync usará para detectar que la auth terminó
 const APP_REDIRECT_URI     = 'com.cuentas.app://oauth2redirect'
 
+// Tiempo mínimo entre sincronizaciones automáticas al abrir la app
+const SYNC_COOLDOWN_MS = 5 * 60 * 1000
+
 export interface ConnectedAccount {
   id: string
   provider: 'gmail' | 'outlook'
@@ -55,9 +58,12 @@ interface UseConnectedAccountsReturn {
   isBackfilling: boolean
   backfillCount: number
   backfillTotal: number
+  isBankDetecting: boolean
+  bankDetectedCount: number
   error: string | null
-  connectGmail: () => Promise<void>
-  runBackfill: () => Promise<void>
+  connectGmail: (hintOverride?: string | null) => Promise<void>
+  runBackfill: (emailAddress?: string) => Promise<void>
+  runBankDetection: (emailAddress?: string) => Promise<void>
   disconnect: (accountId: string) => Promise<void>
 }
 
@@ -86,11 +92,17 @@ export function useConnectedAccounts(
   const [isBackfilling, setIsBackfilling] = useState(false)
   const [backfillCount, setBackfillCount] = useState(0)
   const [backfillTotal, setBackfillTotal] = useState(0)
-  const [error, setError]                 = useState<string | null>(null)
+  const [error, setError]                         = useState<string | null>(null)
+  const [isBankDetecting, setIsBankDetecting]     = useState(false)
+  const [bankDetectedCount, setBankDetectedCount] = useState(0)
   // Ref para evitar backfills concurrentes (no usar state para evitar stale closures)
-  const backfillRunningRef    = useRef(false)
+  const backfillRunningRef      = useRef(false)
+  const bankDetectionRunningRef = useRef(false)
   // Auto-disparar backfill solo una vez por montaje del hook
-  const hasAutoBackfilledRef  = useRef(false)
+  const hasAutoBackfilledRef    = useRef(false)
+  const hasAutoBankDetectedRef  = useRef(false)
+  // Ref para acceder a accounts sin stale closures dentro de runBackfill
+  const accountsRef             = useRef<ConnectedAccount[]>([])
 
   // Cargar cuentas conectadas desde la vista pública de Supabase
   const loadAccounts = useCallback(async () => {
@@ -117,6 +129,7 @@ export function useConnectedAccounts(
         backfillCompletedAt: row.backfillCompletedAt ?? null,
       }))
       setAccounts(mapped)
+      accountsRef.current = mapped
     } catch (e) {
       setError('Error al cargar cuentas conectadas')
       console.error('[useConnectedAccounts] loadAccounts:', e)
@@ -127,48 +140,76 @@ export function useConnectedAccounts(
 
   useEffect(() => { void loadAccounts() }, [loadAccounts])
 
-  // ── runBackfill: lógica de escaneo extraída para reutilizarla ───────────────
-  // Se llama tanto desde connectGmail (primera conexión) como desde el
-  // auto-trigger de montaje (cuenta ya conectada sin escaneo previo).
-  const runBackfill = useCallback(async () => {
+  // ── runBackfill: escanea una cuenta específica o todas las que necesitan sync ──
+  // emailAddress?: si se especifica, sincroniza solo esa cuenta.
+  //               si no, sincroniza todas las cuentas Gmail activas que lo necesiten,
+  //               respetando SYNC_COOLDOWN_MS entre sincronizaciones automáticas.
+  const runBackfill = useCallback(async (emailAddress?: string) => {
     if (!userId || backfillRunningRef.current) return
+
+    // Determinar qué cuentas sincronizar ANTES de adquirir el lock (sin flicker de UI)
+    const toSync: string[] = emailAddress
+      ? [emailAddress]
+      : accountsRef.current
+          .filter(a => {
+            if (a.provider !== 'gmail' || !a.isActive) return false
+            if (!a.backfillCompletedAt) return true  // primer sync → 90 días
+            return (Date.now() - new Date(a.backfillCompletedAt).getTime()) > SYNC_COOLDOWN_MS
+          })
+          .map(a => a.emailAddress)
+
+    if (toSync.length === 0) return  // nada que sincronizar
+
     backfillRunningRef.current = true
     setIsBackfilling(true)
     setBackfillCount(0)
     setBackfillTotal(0)
+
     try {
       const { data: { session } } = await supabase.auth.getSession()
       if (!session) return
-      let pageToken: string | undefined
-      let accProcessed = 0
-      do {
-        const backfillRes = await fetch(
-          `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/backfill-gmail`,
-          {
-            method:  'POST',
-            headers: {
-              'Content-Type':  'application/json',
-              'Authorization': `Bearer ${session.access_token}`,
-            },
-            body: JSON.stringify({ userId, ...(pageToken ? { pageToken } : {}) }),
+
+      let totalProcessed = 0
+
+      // Sincronizar cada cuenta secuencialmente
+      for (const email of toSync) {
+        let pageToken: string | undefined
+        let sinceDateToken: string | undefined
+        do {
+          const backfillRes = await fetch(
+            `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/backfill-gmail`,
+            {
+              method:  'POST',
+              headers: {
+                'Content-Type':  'application/json',
+                'Authorization': `Bearer ${session.access_token}`,
+              },
+              body: JSON.stringify({
+                userId,
+                emailAddress: email,
+                ...(pageToken      ? { pageToken }                : {}),
+                ...(sinceDateToken ? { sinceDate: sinceDateToken } : {}),
+              }),
+            }
+          )
+          const bf = await backfillRes.json() as {
+            processed: number
+            total: number
+            nextPageToken?: string | null
+            done: boolean
+            sinceDate?: string
+            isIncremental?: boolean
           }
-        )
-        const bf = await backfillRes.json() as {
-          processed: number
-          total: number
-          nextPageToken?: string | null
-          done: boolean
-        }
-        accProcessed += bf.processed
-        pageToken = bf.nextPageToken ?? undefined
-        setBackfillCount(accProcessed)
-        setBackfillTotal(bf.total)
-        if (bf.done) break
-      } while (pageToken)
-      // Recargar cuentas y forzar recarga de facturas en useInvoices
+          sinceDateToken  = bf.sinceDate ?? sinceDateToken
+          totalProcessed += bf.processed
+          pageToken       = bf.nextPageToken ?? undefined
+          setBackfillCount(totalProcessed)
+          setBackfillTotal(bf.total)
+          if (bf.done) break
+        } while (pageToken)
+      }
+
       await loadAccounts()
-      DeviceEventEmitter.emit(INVOICES_UPDATED_EVENT)
-      // Forzar recarga de facturas en useInvoices (Realtime puede llegar tarde)
       DeviceEventEmitter.emit(INVOICES_UPDATED_EVENT)
     } catch (bfErr) {
       console.warn('[useConnectedAccounts] backfill error:', bfErr)
@@ -178,22 +219,98 @@ export function useConnectedAccounts(
     }
   }, [userId, loadAccounts])
 
-  // Auto-disparar backfill si la cuenta ya está conectada pero nunca se escaneó.
-  // hasAutoBackfilledRef garantiza que solo corra una vez por montaje del hook,
-  // evitando loops ante re-renders.
+  // ── runBankDetection: escanea correos bancarios para detectar movimientos ────
+  // Mismo patrón paginado que runBackfill — llama detect-bank-emails con pageToken.
+  const runBankDetection = useCallback(async (emailAddress?: string) => {
+    if (!userId || bankDetectionRunningRef.current) return
+
+    const toScan: string[] = emailAddress
+      ? [emailAddress]
+      : accountsRef.current
+          .filter(a => a.provider === 'gmail' && a.isActive)
+          .map(a => a.emailAddress)
+
+    if (toScan.length === 0) return
+
+    bankDetectionRunningRef.current = true
+    setIsBankDetecting(true)
+    setBankDetectedCount(0)
+
+    try {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (!session) return
+
+      let totalDetected = 0
+
+      for (const email of toScan) {
+        let pageToken:    string | undefined
+        let sinceDateToken: string | undefined
+        do {
+          const res = await fetch(
+            `${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1/detect-bank-emails`,
+            {
+              method:  'POST',
+              headers: {
+                'Content-Type':  'application/json',
+                'Authorization': `Bearer ${session.access_token}`,
+              },
+              body: JSON.stringify({
+                userId,
+                emailAddress: email,
+                ...(pageToken      ? { pageToken }                : {}),
+                ...(sinceDateToken ? { sinceDate: sinceDateToken } : {}),
+              }),
+            }
+          )
+          const data = await res.json() as {
+            detected:      number
+            created:       number
+            done:          boolean
+            sinceDate?:    string
+            nextPageToken?: string
+          }
+          sinceDateToken  = data.sinceDate ?? sinceDateToken
+          totalDetected  += data.created
+          pageToken       = data.nextPageToken ?? undefined
+          setBankDetectedCount(totalDetected)
+          if (data.done) break
+        } while (pageToken)
+      }
+
+      if (totalDetected > 0) {
+        DeviceEventEmitter.emit('BANK_MOVEMENTS_UPDATED')
+      }
+    } catch (err) {
+      console.warn('[useConnectedAccounts] bankDetection error:', err)
+    } finally {
+      bankDetectionRunningRef.current = false
+      setIsBankDetecting(false)
+    }
+  }, [userId])
+
+  // Auto-disparar sync al montar si hay alguna cuenta Gmail activa.
+  // runBackfill() sin args determina internamente qué cuentas necesitan sync
+  // (primer sync vs. incremental, respetando SYNC_COOLDOWN_MS).
+  // hasAutoBackfilledRef evita múltiples disparos por re-renders en el mismo montaje.
   useEffect(() => {
     if (isLoading) return
-    if (hasAutoBackfilledRef.current) return
-    const needsBackfill = accounts.some(
-      a => a.provider === 'gmail' && a.isActive && a.backfillCompletedAt === null
-    )
-    if (needsBackfill) {
-      hasAutoBackfilledRef.current = true
-      void runBackfill()
+    if (!hasAutoBackfilledRef.current) {
+      const hasGmailAccount = accounts.some(a => a.provider === 'gmail' && a.isActive)
+      if (hasGmailAccount) {
+        hasAutoBackfilledRef.current = true
+        void runBackfill()
+      }
     }
-  }, [isLoading, accounts, runBackfill])
+    if (!hasAutoBankDetectedRef.current) {
+      const hasGmailAccount = accounts.some(a => a.provider === 'gmail' && a.isActive)
+      if (hasGmailAccount) {
+        hasAutoBankDetectedRef.current = true
+        void runBankDetection()
+      }
+    }
+  }, [isLoading, accounts, runBackfill, runBankDetection])
 
-  const connectGmail = useCallback(async () => {
+  const connectGmail = useCallback(async (hintOverride?: string | null) => {
     if (!userId) return
     setError(null)
     setIsConnecting(true)
@@ -201,6 +318,11 @@ export function useConnectedAccounts(
       // 1. Generar PKCE
       const codeVerifier  = generateCodeVerifier()
       const codeChallenge = await generateCodeChallenge(codeVerifier)
+
+      // hintOverride === undefined  → usar emailHint del hook (cuenta principal Google)
+      // hintOverride === null       → sin hint, el usuario elige la cuenta en el browser
+      // hintOverride === 'email...' → hint explícito
+      const hint = hintOverride === undefined ? emailHint : (hintOverride ?? undefined)
 
       // 2. Construir URL de autorización de Google
       const params = new URLSearchParams({
@@ -212,7 +334,7 @@ export function useConnectedAccounts(
         prompt:                'consent',
         code_challenge:        codeChallenge,
         code_challenge_method: 'S256',
-        ...(emailHint ? { login_hint: emailHint } : {}),
+        ...(hint ? { login_hint: hint } : {}),
       })
       const authUrl = `${GOOGLE_AUTH_ENDPOINT}?${params.toString()}`
 
@@ -259,13 +381,13 @@ export function useConnectedAccounts(
         }
       )
 
-      const json = await res.json() as { success?: boolean; error?: string }
+      const json = await res.json() as { success?: boolean; error?: string; emailAddress?: string }
       if (!res.ok || !json.success) throw new Error(json.error ?? 'Error al conectar cuenta')
 
       await loadAccounts()
-
-      // Iniciar backfill (reutiliza runBackfill para no duplicar lógica)
-      await runBackfill()
+      // Iniciar backfill e detección bancaria para la cuenta recién conectada
+      await runBackfill(json.emailAddress)
+      void runBankDetection(json.emailAddress)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Error al conectar Gmail')
     } finally {
@@ -295,5 +417,5 @@ export function useConnectedAccounts(
     }
   }, [loadAccounts])
 
-  return { accounts, isLoading, isConnecting, isBackfilling, backfillCount, backfillTotal, error, connectGmail, runBackfill, disconnect }
+  return { accounts, isLoading, isConnecting, isBackfilling, backfillCount, backfillTotal, isBankDetecting, bankDetectedCount, error, connectGmail, runBackfill, runBankDetection, disconnect }
 }

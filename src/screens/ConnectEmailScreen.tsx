@@ -149,11 +149,14 @@ export default function ConnectEmailScreen({ onBack }: Props): React.JSX.Element
                     <Text style={styles.accountIcon}>
                       {account.provider === 'gmail' ? '📧' : '📨'}
                     </Text>
-                    <View>
+                    <View style={{ flex: 1 }}>
                       <Text style={styles.accountEmail}>{account.emailAddress}</Text>
                       <Text style={styles.accountMeta}>
                         {account.isActive ? '✅ Activa' : '⚠️ Inactiva'} ·{' '}
                         {account.provider === 'gmail' ? 'Gmail' : 'Outlook'}
+                        {account.backfillCompletedAt && (
+                          ' · sincronizada'
+                        )}
                       </Text>
                     </View>
                   </View>
@@ -168,39 +171,55 @@ export default function ConnectEmailScreen({ onBack }: Props): React.JSX.Element
             </>
           )}
 
-          {/* Botones agregar cuenta — solo mostrar Gmail si no tiene la cuenta Google ya conectada */}
-          {!googleAccountConnected && (
-            <>
-              <Text style={styles.sectionTitle}>
-                {accounts.length > 0 ? 'Agregar otra cuenta' : 'Agregar cuenta'}
-              </Text>
+          {/* Sección agregar cuenta — siempre visible */}
+          <Text style={styles.sectionTitle}>
+            {accounts.length > 0 ? 'Agregar otra cuenta' : 'Agregar cuenta'}
+          </Text>
 
-              {/* Si no es usuario Google, mostrar botón Gmail genérico */}
-              {!isGoogleUser && (
-                <TouchableOpacity
-                  style={[styles.connectButton, isConnecting && styles.connectButtonDisabled]}
-                  onPress={() => void connectGmail()}
-                  disabled={isConnecting}
-                >
-                  {isConnecting ? (
-                    <ActivityIndicator color="#fff" />
-                  ) : (
-                    <>
-                      <Text style={styles.connectButtonIcon}>G</Text>
-                      <Text style={styles.connectButtonText}>Conectar Gmail</Text>
-                    </>
-                  )}
-                </TouchableOpacity>
+          {/*
+            Boton Gmail:
+            - Oculto si el usuario es Google Y aún no conecta su cuenta primaria
+              (el banner de arriba ya tiene el botón “Autorizar” para ese caso)
+            - Visible en todos los demás casos:
+                · Usuario no-Google que aún no conecta nada
+                · Cualquier usuario que ya tiene al menos una cuenta y quiere añadir otra
+            - Llama connectGmail(null) para que el usuario elija la cuenta en el browser
+              (sin login_hint, así puede seleccionar una cuenta diferente a la principal)
+          */}
+          {!(isGoogleUser && !googleAccountConnected) && (
+            <TouchableOpacity
+              style={[
+                accounts.length > 0 ? styles.connectButtonSecondary : styles.connectButton,
+                isConnecting && styles.connectButtonDisabled,
+              ]}
+              onPress={() => void connectGmail(null)}
+              disabled={isConnecting}
+            >
+              {isConnecting ? (
+                <ActivityIndicator color={accounts.length > 0 ? '#2563eb' : '#fff'} />
+              ) : (
+                <>
+                  <Text style={[
+                    styles.connectButtonIcon,
+                    accounts.length > 0 && { color: '#2563eb' },
+                  ]}>G</Text>
+                  <Text style={[
+                    styles.connectButtonText,
+                    accounts.length > 0 && { color: '#2563eb' },
+                  ]}>
+                    {accounts.length > 0 ? 'Agregar otra cuenta Gmail' : 'Conectar Gmail'}
+                  </Text>
+                </>
               )}
-
-              {/* Outlook — Fase 3b */}
-              <TouchableOpacity style={[styles.connectButton, styles.connectButtonOutlook]} disabled>
-                <Text style={styles.connectButtonIcon}>⊞</Text>
-                <Text style={styles.connectButtonText}>Conectar Outlook</Text>
-                <Text style={styles.comingSoon}>Próximamente</Text>
-              </TouchableOpacity>
-            </>
+            </TouchableOpacity>
           )}
+
+          {/* Outlook — Fase 3b */}
+          <TouchableOpacity style={[styles.connectButton, styles.connectButtonOutlook]} disabled>
+            <Text style={styles.connectButtonIcon}>⊞</Text>
+            <Text style={styles.connectButtonText}>Conectar Outlook</Text>
+            <Text style={styles.comingSoon}>Próximamente</Text>
+          </TouchableOpacity>
         </>
       )}
 
@@ -308,6 +327,18 @@ const styles = StyleSheet.create({
     gap: 10,
   },
   connectButtonDisabled: { opacity: 0.6 },
+  connectButtonSecondary: {
+    borderWidth: 1.5,
+    borderColor: '#2563eb',
+    backgroundColor: '#fff',
+    borderRadius: 10,
+    padding: 14,
+    flexDirection: 'row' as const,
+    alignItems: 'center' as const,
+    justifyContent: 'center' as const,
+    marginBottom: 12,
+    gap: 10,
+  },
   connectButtonOutlook:  { backgroundColor: '#0078d4', opacity: 0.5 },
   connectButtonIcon: { color: '#fff', fontSize: 18, fontWeight: '700' },
   connectButtonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
